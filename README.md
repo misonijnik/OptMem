@@ -6,6 +6,33 @@ Permanent memory for AI agents. A 426-token prompt, a script, plug and play.
 
 ## Install
 
+From a local checkout, with [uv](https://docs.astral.sh/uv/):
+
+```sh
+uv tool install .
+memo init --instructions ./AGENTS.md
+```
+
+Use `./CLAUDE.md` instead for Claude, or pass the path to another instruction
+file. OptMem prepends a marked memory block, preserving existing instructions.
+Run setup again to update that block without duplicating it. Plain `memo init`
+prints the block for manual setup instead. Memories stay at `~/.optmem/memory`.
+
+If uv reports that its executable directory is missing from `PATH`, run
+`uv tool update-shell` and open a new terminal.
+
+After changing or updating the local checkout, reinstall with:
+
+```sh
+uv tool install --reinstall .
+```
+
+`uv tool uninstall optmem` removes the installed command; memories remain.
+
+### Standalone installer
+
+With Python 3 installed, you can also use the original single-file installer:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh
 ```
@@ -14,12 +41,14 @@ It prints a `## Memory` block. Paste that at the top of your agent's
 `AGENTS.md` (or `CLAUDE.md`), and you are done. Run the same line again to
 update.
 
-The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
+This installer puts the tool at `~/.optmem/memo`; put `~/.optmem` on `PATH` to
+type `memo`, or invoke that path directly.
 
 ## Commands
 
 | | |
 |---|---|
+| `memo init [--instructions FILE]` | create memory; print or install the agent instructions |
 | `memo wake` | read the memory — the first command of every session |
 | `memo note "..."` | record one memory: one line, up to 280 bytes |
 | `memo nap` | answer the merges that came due |
@@ -34,12 +63,15 @@ background.
 
 ```
 ~/.optmem/
-  memo          the tool: one file of Python 3, no dependencies
+  memo          the tool, if installed with the standalone installer
   memory/
     LOG.txt     every memory, one per line, append-only, never edited
     TREE/       the summaries: a cache, rebuildable from the log alone
     config      the sizes, written by `memo config`
 ```
+
+With uv, the executable and its Python environment are managed by uv. Both
+installation methods use the same memory directory and no runtime dependencies.
 
 ```sh
 memo config                  # show the sizes

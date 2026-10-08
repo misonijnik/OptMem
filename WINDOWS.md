@@ -2,6 +2,20 @@
 
 OptMem now runs on native Windows (no WSL required).
 
+## Install from a local checkout
+
+With uv installed, run:
+
+```bat
+uv tool install .
+memo init --instructions .\AGENTS.md
+```
+
+Use `.\CLAUDE.md` for Claude. Existing instructions are preserved, and running
+setup again updates the OptMem block. If uv reports a PATH warning, run
+`uv tool update-shell` and open a new terminal. Reinstall local changes with
+`uv tool install --reinstall .`.
+
 ## What changed
 - `import fcntl` is guarded — falls back to `None` on platforms without it.
 - `locked()` uses `msvcrt` advisory locking with spin/backoff when `fcntl`

@@ -199,6 +199,81 @@ check(r_.returncode == 1 and "Traceback" not in r_.stderr
       and "Not a directory" in r_.stderr,
       "a filesystem error printed a traceback: " + r_.stderr)
 
+# Instruction setup preserves the user's text, updates only its own block,
+# and leaves the live memory untouched when repeated.
+instructions = os.path.join(fresh["HOME"], "AGENTS.md")
+original = "# Project instructions\r\n\r\nKeep the user's text: caf\u00e9.\r\n"
+with open(instructions, "w", encoding="utf-8", newline="") as f:
+    f.write(original)
+setup_args = memo + ["init", "--instructions", instructions]
+r_ = subprocess.run(setup_args, capture_output=True, text=True, env=fresh)
+with open(instructions, encoding="utf-8", newline="") as f:
+    installed = f.read()
+check(r_.returncode == 0 and installed.endswith(original),
+      "setup did not preserve existing instructions: " + r_.stderr)
+check(installed.startswith(cli.INSTRUCTIONS_START) and "## Memory" in installed,
+      "setup did not prepend a marked prompt")
+log = os.path.join(fresh["HOME"], ".optmem", "memory", "LOG.txt")
+before_setup = open(log, "rb").read()
+r_ = subprocess.run(setup_args, capture_output=True, text=True, env=fresh)
+check(open(instructions, "rb").read() == installed.encode(),
+      "repeating setup duplicated or changed instructions")
+check(open(log, "rb").read() == before_setup, "setup modified memories")
+# Updating the configured note size must replace the block, preserving text
+# both before and after it.
+prefix = "# User preamble\n\n"
+with open(instructions, "w", encoding="utf-8", newline="") as f:
+    f.write(prefix + installed)
+subprocess.run(memo + ["config", "ENTRY_CHARS=200"], env=fresh,
+               capture_output=True, text=True)
+r_ = subprocess.run(setup_args, capture_output=True, text=True, env=fresh)
+with open(instructions, encoding="utf-8", newline="") as f:
+    updated = f.read()
+check(r_.returncode == 0 and "max 200 bytes" in updated
+      and updated.startswith(prefix) and updated.endswith(original)
+      and updated.count(cli.INSTRUCTIONS_START) == 1,
+      "setup failed to update just its own block")
+new_instructions = os.path.join(fresh["HOME"], "CLAUDE.md")
+r_ = subprocess.run(memo + ["init", "--instructions", new_instructions],
+                    capture_output=True, text=True, env=fresh)
+check(r_.returncode == 0 and os.path.isfile(new_instructions),
+      "setup failed to create a missing instruction file")
+for invalid in (cli.INSTRUCTIONS_START, cli.INSTRUCTIONS_END,
+                cli.INSTRUCTIONS_START * 2 + cli.INSTRUCTIONS_END,
+                cli.INSTRUCTIONS_END + cli.INSTRUCTIONS_START):
+    with open(instructions, "w", encoding="utf-8") as f:
+        f.write(invalid)
+    r_ = subprocess.run(setup_args, capture_output=True, text=True, env=fresh)
+    check(r_.returncode == 1 and open(instructions, encoding="utf-8").read() == invalid,
+          "setup changed an instruction file with malformed markers")
+with open(instructions, "wb") as f:
+    f.write(b"invalid UTF-8: \xff")
+r_ = subprocess.run(setup_args, capture_output=True, text=True, env=fresh)
+check(r_.returncode == 1 and "not UTF-8" in r_.stderr
+      and open(instructions, "rb").read() == b"invalid UTF-8: \xff",
+      "setup modified or crashed on non-UTF-8 instructions")
+for args in (["--instructions"], ["--instructions", ""], ["--unknown", instructions]):
+    r_ = subprocess.run(memo + ["init"] + args, capture_output=True, text=True, env=fresh)
+    check(r_.returncode == 1 and "usage:" in r_.stderr,
+          "setup accepted invalid arguments: %r" % args)
+
+# Commands printed by a launcher in a directory containing spaces must run.
+spaced = os.path.join(fresh["HOME"], "a folder with spaces")
+os.makedirs(spaced)
+spaced_memo = os.path.join(spaced, "memo")
+shutil.copy2(MEMO, spaced_memo)
+subprocess.run([sys.executable, spaced_memo, "note", "space probe first"],
+               capture_output=True, text=True, env=fresh)
+r_ = subprocess.run([sys.executable, spaced_memo, "note", "space probe"],
+                    capture_output=True, text=True, env=fresh)
+orders = [line[5:] for line in r_.stdout.splitlines() if line.startswith("Run: ")]
+check(bool(orders), "the spaced-path probe did not print a merge command")
+if orders:
+    obeyed = subprocess.run(orders[0].replace('"<your line>"', '"merged space probe"'),
+                            shell=True, capture_output=True, text=True, env=bare)
+    check(obeyed.returncode == 0 and "saved" in obeyed.stdout,
+          "the command printed for a spaced launcher failed: " + obeyed.stderr)
+
 
 r = run("note", "x" * 281)
 check(r.returncode == 1 and "Too long" in r.stderr, "over-long note accepted")

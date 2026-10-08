@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """OptMem: a permanent, append-only memory for AI agents.
 
-  {memo} init             create this memory; print the setup block.
+  {memo} init [--instructions FILE]
+                         create this memory; print or install the setup block.
   {memo} wake [part [T]]  read your memory. Run first, every session.
   {memo} note "..."       record one memory: one short line.
   {memo} nap [id "..."]   do the pending compressions.
@@ -22,7 +23,9 @@ except ImportError:
     fcntl = None  # Windows has no fcntl; we fall back to msvcrt below
 import os
 import re
+import shlex
 import sys
+import tempfile
 from collections import deque
 
 
@@ -40,9 +43,23 @@ def pretty(p):
     return "~" + p[len(home):] if p.startswith(home + os.sep) else p
 
 
-# Every command this tool prints has to RUN. After `curl | sh` nothing is on
-# PATH, so a bare `memo nap 0-1 "..."` would not: the tool names itself.
-ME = pretty(__file__)
+def executable_command(path):
+    """Name the launcher, keeping commands runnable even with spaces in HOME."""
+    path = os.path.abspath(path)
+    if os.name == "nt":
+        from subprocess import list2cmdline
+        # Some console launchers strip .exe from argv[0] before calling us.
+        if os.path.isfile(path + ".exe"):
+            path += ".exe"
+        argv = [path] if path.lower().endswith((".exe", ".cmd", ".bat")) else [sys.executable, path]
+        return list2cmdline(argv)
+    display = pretty(path)
+    return display if re.fullmatch(r"[A-Za-z0-9_./~-]+", display) else shlex.quote(path)
+
+
+# Direct-script callers need no PATH setup. Packaged callers use their
+# console launcher (set in main), rather than the module in site-packages.
+ME = executable_command(__file__)
 
 # The sizes a memory may override in its own `config` file: the default, and
 # what it means. `memo config` shows and edits them. The globals below start
@@ -542,13 +559,43 @@ When you spawn one, write: `You are a subagent. Don't run memo.`
 """
 
 
+INSTRUCTIONS_START = "<!-- optmem:start -->"
+INSTRUCTIONS_END = "<!-- optmem:end -->"
+
+
+def instructions_content(path, block):
+    """Replace our one marked block, or prepend it to existing instructions."""
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            current = f.read()
+    except FileNotFoundError:
+        current = ""
+    except UnicodeError:
+        die("%s is not UTF-8; instructions were not changed." % pretty(path))
+    start, end = INSTRUCTIONS_START, INSTRUCTIONS_END
+    if start in current or end in current:
+        if current.count(start) != 1 or current.count(end) != 1:
+            die("%s has incomplete or duplicate OptMem markers; instructions were not changed."
+                % pretty(path))
+        lo, hi = current.index(start), current.index(end)
+        if hi < lo:
+            die("%s has reversed OptMem markers; instructions were not changed." % pretty(path))
+        return current[:lo] + block + current[hi + len(end):]
+    return block + "\n" + ("\n" + current if current else "")
+
+
 def cmd_init(d, args):
     """The one command that may create the memory directory, and the whole
-    setup: make the store, write the size knobs, print the block the user
-    pastes into their agent's instruction file. Re-running it is safe: it
-    only ever creates what is missing, and never rewrites what is there."""
+    setup: make the store, write missing size knobs, and print or install the
+    agent instructions. Re-running it never overwrites existing memories."""
+    path = None
     if args:
-        die("usage: %s init" % ME)
+        if len(args) != 2 or args[0] != "--instructions" or not args[1]:
+            die("usage: %s init [--instructions FILE]" % ME)
+        path = os.path.expanduser(args[1])
+    # Validate existing instructions before creating a new memory.
+    if path is not None:
+        instructions_content(path, "")
     fresh = not os.path.isdir(d)
     os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
     open(log_path(d), "a").close()
@@ -560,10 +607,29 @@ def cmd_init(d, args):
     else:
         print("Found %s: %s." % (pretty(d), plural(log_len(d), "memory")))
     print("Sizes live in %s/config; the defaults are fine." % pretty(d))
-    print()
-    print("Paste this at the top of your agent's AGENTS.md (or CLAUDE.md), done:")
-    print()
-    print(TEMPLATE.format(memo=ME, data=pretty(d), chars=ENTRY_CHARS).rstrip())
+    prompt = TEMPLATE.format(memo=ME, data=pretty(d), chars=ENTRY_CHARS).rstrip()
+    if path is not None:
+        block = INSTRUCTIONS_START + "\n" + prompt + "\n" + INSTRUCTIONS_END
+        content = instructions_content(path, block)
+        # Replace atomically, following existing symlinks and preserving file
+        # permissions, so a failed write cannot truncate the user's text.
+        destination = os.path.realpath(path)
+        fd, temporary = tempfile.mkstemp(prefix=".optmem-", dir=os.path.dirname(destination))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+            if os.path.exists(destination):
+                os.chmod(temporary, os.stat(destination).st_mode & 0o777)
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        print("OptMem instructions installed in %s." % pretty(path))
+    else:
+        print()
+        print("Paste this at the top of your agent's AGENTS.md (or CLAUDE.md), done:")
+        print()
+        print(prompt)
 
 
 def paginate(lines):
@@ -829,6 +895,8 @@ COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,
 
 
 def main():
+    global ME
+    ME = executable_command(sys.argv[0])
     usage = __doc__.strip().format(memo=ME)
     if len(sys.argv) < 2:
         print(usage)
