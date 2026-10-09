@@ -154,7 +154,14 @@ Stable hook fields capture new prompts, tool inputs/results, and final replies.
 An incremental rollout adapter also captures intermediate visible replies and
 backfills resumed chats. Codex does not guarantee the rollout format; the
 adapter is isolated and tested against the currently installed format. The
-plugin archives text, not binary image/audio attachments or full subagent
+adapter accepts both legacy message events and current `response_item` messages,
+excluding environment/context injections. Synchronous hooks spend at most about
+two seconds replaying a resumed transcript, checkpointing every 64 processed
+records and at the budget boundary. Later hooks resume from the saved byte
+offset; duplicate records do not rewrite the views. Large first-time backfills
+may take several hook deliveries to finish, while direct hook fields still
+capture the active prompt, tool result, and final reply.
+The plugin archives text, not binary image/audio attachments or full subagent
 conversations. Those remain in their original Codex sessions.
 
 ## CLI and legacy notes

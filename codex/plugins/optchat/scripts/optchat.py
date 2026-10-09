@@ -9,6 +9,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from optchat_memory import FileLock, Store, NODE_BYTES, VIEW_HIGH, byte_size, chunks
@@ -77,7 +78,7 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def ingest(store, event):
+def ingest(store, event, deadline=None):
     """Incremental Codex rollout adapter; never persist reasoning or prompts.
 
     Hook event fields are stable. The rollout adapter is isolated because
@@ -88,7 +89,7 @@ def ingest(store, event):
     turn = str(event.get("turn_id", "unknown"))
     if path and Path(path).is_file():
         key = "transcript:" + str(Path(path).resolve())
-        cursor = store.state(key, {"offset": 0, "turn": "unknown"})
+        cursor = store.state(key, {"offset": 0, "turn": turn})
         offset, turn = cursor["offset"], cursor["turn"]
         if Path(path).stat().st_size < offset:
             # Codex may rotate/rewrite a rollout. Source keys suppress replayed
@@ -96,6 +97,7 @@ def ingest(store, event):
             offset, turn = 0, "unknown"
         with open(path, "rb") as stream:
             stream.seek(offset)
+            rows = 0
             while True:
                 start = stream.tell()
                 line = stream.readline()
@@ -103,6 +105,7 @@ def ingest(store, event):
                     break  # a writer may still be completing the last line
                 row = json.loads(line)
                 payload = row.get("payload", {})
+                offset = stream.tell()
                 if not isinstance(payload, dict):
                     continue
                 kind = payload.get("type")
@@ -127,12 +130,35 @@ def ingest(store, event):
                         output = payload.get("output", "")
                         text = output if isinstance(output, str) else encode(output)
                         source = "%s:echo:%s" % (session, payload.get("call_id", start))
-                    # response_item messages duplicate the event_msg messages
-                    # in current Codex rollouts. Developer/system and reasoning
-                    # records (including encrypted reasoning) are never logged.
+                    elif kind == "message" and payload.get("role") in ("user", "assistant"):
+                        # New Codex rollouts no longer emit user_message and
+                        # agent_message events. Share keys with older events.
+                        meta = payload.get("internal_chat_message_metadata_passthrough") or {}
+                        kinds = meta.get("content_item_kinds")
+                        role = payload["role"]
+                        if role == "user" and kinds and "user.text" not in kinds:
+                            continue  # environment/context injections aren't user requests
+                        text = "\n".join(c.get("text", "") for c in payload.get("content", [])
+                                         if isinstance(c, dict) and c.get("type", "text") in ("input_text", "output_text", "text"))
+                        message_turn = str(meta.get("turn_id") or turn)
+                        turn = message_turn
+                        log_kind = "user" if role == "user" else "unii"
+                        if role == "user":
+                            source = "%s:%s:user:%s" % (session, message_turn, digest(text))
+                        elif payload.get("phase") == "final":
+                            source = "%s:%s:final:%s" % (session, message_turn, digest(text))
+                    # Developer/system and reasoning records are never logged.
                 if log_kind and isinstance(text, str):
-                    store.append(log_kind, text, date=row.get("timestamp"), source=source)
-                offset = stream.tell()
+                    store.append(log_kind, text, date=row.get("timestamp"), source=source, defer_views=True)
+                rows += 1
+                if rows % 64 == 0 or (deadline is not None and time.monotonic() >= deadline):
+                    store.settle_short()
+                    store.update_views()
+                    store.set_state(key, {"offset": offset, "turn": turn})
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
+        store.settle_short()
+        store.update_views()
         store.set_state(key, {"offset": offset, "turn": turn})
 
     # Direct stable hook fields cover records not yet flushed to the rollout,
@@ -386,7 +412,9 @@ def hook(compact_after=False):
         print("{}")
         return
     with Store(directory()) as store:
-        ingest(store, event)
+        # Resume backfills must make progress without consuming the 30-second
+        # synchronous hook timeout. Later hooks continue from a durable cursor.
+        ingest(store, event, deadline=time.monotonic() + 2)
         output = {}
         if name == "SessionStart":
             # Keep the dispatcher small. The fresh worker retrieves memory

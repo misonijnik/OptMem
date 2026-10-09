@@ -257,6 +257,47 @@ class StorageTests(unittest.TestCase):
             optchat.ingest(store, event)
             self.assertEqual(store.total, 1)
 
+    def test_current_rollout_messages_exclude_injected_context(self):
+        rollout = self.root / "current.jsonl"
+        rows = [
+            {"type": "response_item", "payload": {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "Keep Tree as default"}],
+             "internal_chat_message_metadata_passthrough": {"turn_id": "t", "content_item_kinds": ["user.text"]}}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "INJECTED ENVIRONMENT"}],
+             "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["environments.environment_context"]}}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "phase": "final",
+             "content": [{"type": "output_text", "text": "Tree restored"}]}},
+        ]
+        rollout.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        event = {"session_id": "s", "turn_id": "t", "transcript_path": str(rollout)}
+        with memory.Store(self.root) as store:
+            optchat.ingest(store, event)
+            optchat.ingest(store, dict(event, hook_event_name="UserPromptSubmit", prompt="Keep Tree as default"))
+            optchat.ingest(store, dict(event, hook_event_name="Stop", last_assistant_message="Tree restored"))
+            self.assertEqual(store.total, 2)
+            self.assertEqual([store.message(i)["text"] for i in range(2)], ["Keep Tree as default", "Tree restored"])
+
+    def test_bounded_rollout_replay_resumes_durable_cursor(self):
+        rollout = self.root / "bounded.jsonl"
+        rows = [{"type": "event_msg", "payload": {"type": "user_message", "message": str(i)}} for i in range(3)]
+        lines = [json.dumps(r) + "\n" for r in rows]
+        rollout.write_text("".join(lines))
+        event = {"session_id": "s", "transcript_path": str(rollout)}
+        with memory.Store(self.root) as store:
+            optchat.ingest(store, event, deadline=0)
+            self.assertEqual(store.total, 1)
+            self.assertEqual(store.state("transcript:" + str(rollout.resolve()))["offset"], len(lines[0]))
+        with memory.Store(self.root) as store:
+            optchat.ingest(store, event)
+            self.assertEqual([store.message(i)["text"] for i in range(3)], ["0", "1", "2"])
+
+    def test_duplicate_append_does_not_rewrite_views(self):
+        with memory.Store(self.root) as store:
+            store.append("user", "same", source="stable")
+            with patch.object(store, "update_views", side_effect=AssertionError("duplicate rebuilt views")):
+                self.assertEqual(store.append("user", "same", source="stable"), [0])
+
     def test_subagent_hook_stores_only_report(self):
         rollout = self.root / "agent.jsonl"
         rollout.write_text(json.dumps({"type": "event_msg", "payload": {

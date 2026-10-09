@@ -286,13 +286,14 @@ class Store:
         self.db.execute("INSERT OR REPLACE INTO cursors VALUES (?,?)", (str(path.relative_to(self.root)), offset))
         self.db.commit()
 
-    def append(self, kind, text, date=None, source=None):
+    def append(self, kind, text, date=None, source=None, defer_views=False):
         if kind not in KINDS or not isinstance(text, str):
             raise ValueError("Messages require a supported kind and text")
         date = date or datetime.datetime.now(datetime.timezone.utc).isoformat()
         datetime.datetime.fromisoformat(date.replace("Z", "+00:00"))
         parts = [clip_output(text)] if kind == "echo" else chunks(text)
         ids = []
+        changed = False
         for part_number, part in enumerate(parts):
             key = "%s:%d" % (source, part_number) if source is not None else None
             existing = self.db.execute("SELECT i FROM messages WHERE source=?", (key,)).fetchone() if key else None
@@ -304,8 +305,10 @@ class Store:
             self.total += 1
             self.view.append([0, i])
             ids.append(i)
-        self.settle_short()
-        self.update_views()
+            changed = True
+        if changed and not defer_views:
+            self.settle_short()
+            self.update_views()
         return ids
 
     def node(self, level, index):
