@@ -1,0 +1,15 @@
+{
+  "name": "optchat",
+  "version": "0.2.0",
+  "description": "Fresh Codex workers backed by permanent chat memory, a batched summary tree, and zoom navigation.",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "OptChat",
+    "shortDescription": "Remember Codex conversations across sessions",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": ["Use OptChat to recover our previous decisions before continuing."]
+  }
+}

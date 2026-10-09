@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "optchat": {
+      "command": "python3",
+      "args": ["./scripts/optchat.py", "serve"],
+      "cwd": ".",
+      "env_vars": ["OPTCHAT_DIR", "OPTCHAT_MODEL", "CODEX_HOME", "CODEX_CLI_PATH"],
+      "startup_timeout_sec": 15
+    }
+  }
+}

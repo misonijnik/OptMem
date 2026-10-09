@@ -1,0 +1,10 @@
+{
+  "name": "optmem-local",
+  "interface": {"displayName": "OptMem local plugins"},
+  "plugins": [{
+    "name": "optchat",
+    "source": {"source": "local", "path": "./plugins/optchat"},
+    "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+    "category": "Productivity"
+  }]
+}

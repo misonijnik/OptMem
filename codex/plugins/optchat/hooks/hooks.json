@@ -1,0 +1,39 @@
+{
+  "description": "Capture visible Codex chat and route root user turns to fresh workers backed by OptChat memory.",
+  "hooks": {
+    "SessionStart": [{"hooks": [{
+      "type": "command",
+      "command": "python3 \"${PLUGIN_ROOT}/scripts/optchat.py\" hook",
+      "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\optchat.py\" hook",
+      "timeout": 30,
+      "additionalContextLimit": 0
+    }]}],
+    "UserPromptSubmit": [{"hooks": [{
+      "type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/optchat.py\" hook",
+      "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\optchat.py\" hook", "timeout": 30
+    }]}],
+    "PreToolUse": [{"hooks": [{
+      "type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/optchat.py\" hook",
+      "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\optchat.py\" hook", "timeout": 30
+    }]}],
+    "PostToolUse": [{"hooks": [{
+      "type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/optchat.py\" hook",
+      "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\optchat.py\" hook", "timeout": 30
+    }]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/optchat.py\" hook",
+       "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\optchat.py\" hook", "timeout": 30},
+      {"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/optchat.py\" hook --compact",
+       "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\optchat.py\" hook --compact",
+       "async": true, "timeout": 600}
+    ]}],
+    "PreCompact": [{"hooks": [{
+      "type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/optchat.py\" hook",
+      "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\optchat.py\" hook", "timeout": 30
+    }]}],
+    "SubagentStop": [{"hooks": [{
+      "type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/optchat.py\" hook",
+      "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\optchat.py\" hook", "timeout": 30
+    }]}]
+  }
+}

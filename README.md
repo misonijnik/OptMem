@@ -4,7 +4,81 @@ Permanent memory for AI agents. A 426-token prompt, a script, plug and play.
 
 ![how OptMem works](anim/optmem.gif)
 
-## Install
+## OptChat for Codex
+
+OptChat is an installable native Codex plugin for persistent chat memory and
+fresh task workers. Hooks record user messages, visible replies, tool calls
+and results automatically. A background compactor summarizes the log into a
+binary tree; `view`, `zoom`, and `date` let Codex recover earlier decisions
+and open the original messages when a summary is too vague.
+
+For each separate user turn, the parent is instructed to start a new native
+subagent without inheriting the parent's conversation history. The worker
+receives the current request and reads OptChat memory before doing the task;
+the parent relays its result. Messages that steer an active task go to its
+existing worker. Workers' final reports become part of the permanent memory.
+
+### Install the plugin from source
+
+Use a checkout containing the `codex/` directory. You need Python 3.8+ on
+`PATH` and a Codex CLI supporting plugins, hooks, and native subagents; this
+installation was tested with Codex CLI 0.161.0. Sign in to Codex normally so
+background compaction can use its saved login.
+
+From the checkout root:
+
+```sh
+cd /path/to/OptMem
+codex plugin marketplace add ./codex
+codex plugin add optchat@optmem-local
+codex plugin list --json
+```
+
+The first command registers this checkout's local marketplace; the second
+installs the bundled plugin into Codex's plugin cache. The list should show
+`optchat@optmem-local`, version `0.2.0`, with `installed` and `enabled` set
+to `true`. The bundle includes its Python scripts, so no build step or uv
+installation is required for the plugin.
+
+Start a **new Codex session** in the project you want to work on. Open `/hooks`
+and review/trust OptChat's hook definitions: installation alone does not enable
+them. Check `/mcp` for the OptChat server. Native subagent tools must also be
+enabled. See the official [hook review instructions](https://learn.chatgpt.com/docs/hooks).
+
+### Use and update
+
+After hook review, logging and fresh-worker routing apply automatically.
+You can explicitly invoke the skill with `$optchat`, for example:
+
+```text
+$optchat Show the current memory status.
+```
+
+Memory stays in `~/.optchat` and is shared across root Codex sessions on this
+machine. Set `OPTCHAT_DIR` before launching Codex to choose another directory.
+The compactor uses your usual Codex model unless you set `OPTCHAT_MODEL`.
+Subagents and compactions use your account's normal model allowance.
+
+After changing the sources, refresh the cached plugin:
+
+```sh
+codex plugin remove optchat@optmem-local
+codex plugin add optchat@optmem-local
+```
+
+Then start a new session and review changed hooks through `/hooks`. Keep the
+checkout at its registered path for later updates. Removing the plugin leaves
+its memory in place. Reinstalling the uv CLI does not refresh the plugin.
+
+Fresh-worker routing is supplied through hook and skill instructions; hooks
+cannot enforce a spawn or reset the parent itself. The parent retains Codex's
+normal history, and Anthropic-specific cache marks do not apply. Reasoning is
+excluded from the log; binary attachments and private subagent steps remain in
+their native Codex sessions. Live end-to-end delegation and model compaction
+have not been tested here.
+See [the plugin guide](codex/README.md) for data layout, settings, and validation.
+
+## Install the `memo` CLI
 
 From a local checkout, with [uv](https://docs.astral.sh/uv/):
 
