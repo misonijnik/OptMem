@@ -243,6 +243,19 @@ class StorageTests(unittest.TestCase):
                                       tool_name="shell", tool_input={"cmd": "ls"}, tool_response="file.py"))
             self.assertEqual(store.total, 4)
             self.assertNotIn("PRIVATE THOUGHT", "".join(p.read_text() for p in self.root.glob("*/*.jsonl")))
+            # A user can intentionally repeat the same prompt in a new turn.
+            # Only delivery retries of that particular turn are duplicates.
+            with rollout.open("a") as stream:
+                for row in (
+                    {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn2"}},
+                    {"type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
+                ):
+                    stream.write(json.dumps(row) + "\n")
+            repeated = dict(event, turn_id="turn2", hook_event_name="UserPromptSubmit", prompt="hello")
+            optchat.ingest(store, repeated)
+            optchat.ingest(store, repeated)
+            self.assertEqual(store.total, 5)
+            self.assertEqual(store.message(0)["text"], store.message(4)["text"])
 
     def test_partial_rollout_record_is_read_only_when_complete(self):
         rollout = self.root / "rollout.jsonl"
@@ -254,6 +267,124 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(store.total, 0)
             with rollout.open("a") as stream:
                 stream.write("\n")
+            optchat.ingest(store, event)
+            self.assertEqual(store.total, 1)
+
+    def test_interrupted_reasoning_replacement_preserves_evidence_and_resumes(self):
+        rollout = self.root / "damaged.jsonl"
+        prefix = "gAAAAA" + "a" * 64
+        fragment = {"timestamp": "old", "ordinal": 12, "type": "response_item", "payload": {
+            "type": "reasoning", "id": "rs_example", "summary": [], "encrypted_content": prefix}}
+        broken = json.dumps(fragment).encode()[:-3] + b"\n"
+        replacement = dict(fragment, timestamp="new", payload=dict(fragment["payload"], encrypted_content=prefix + "tail"))
+        replacement_bytes = (json.dumps(replacement) + "\n").encode()
+        before = (json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "before"}}) + "\n").encode()
+        after = (json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "after"}}) + "\n").encode()
+        original = before + broken + replacement_bytes + after
+        rollout.write_bytes(original)
+        event = {"session_id": "s", "turn_id": "t", "transcript_path": str(rollout),
+                 "hook_event_name": "UserPromptSubmit", "prompt": "current prompt"}
+        with memory.Store(self.root) as store:
+            optchat.ingest(store, event)
+            self.assertEqual([store.message(i)["text"] for i in range(store.total)],
+                             ["before", "after", "current prompt"])
+            cursor_key = "transcript:" + str(rollout.resolve())
+            self.assertEqual(store.state(cursor_key)["offset"], len(original))
+            diagnostic = store.state("last_replay_error")
+            self.assertEqual(diagnostic["offset"], len(before))
+            self.assertEqual(diagnostic["bytes"], len(broken))
+            self.assertEqual(diagnostic["sha256"], optchat.hashlib.sha256(broken).hexdigest())
+            self.assertEqual(diagnostic["recovery"], "superseded_reasoning")
+            self.assertEqual(diagnostic["replacement"], {
+                "offset": len(before) + len(broken), "bytes": len(replacement_bytes),
+                "sha256": optchat.hashlib.sha256(replacement_bytes).hexdigest(),
+                "ordinal": 12, "reasoning_id": "rs_example"})
+            store.set_state(cursor_key, {"offset": len(before), "turn": "t"})
+            optchat.ingest(store, event)
+            self.assertEqual(store.total, 3)
+            self.assertEqual(store.db.execute("SELECT count(*) FROM state WHERE key LIKE 'transcript-error:%'").fetchone()[0], 1)
+        with memory.Store(self.root) as store:
+            self.assertEqual(store.state("last_replay_error"), diagnostic)
+        status = optchat.invoke("status", {})
+        self.assertEqual(status["replay_errors"], 1)
+        self.assertEqual(status["last_replay_error"], diagnostic)
+        self.assertEqual(rollout.read_bytes(), original)
+        self.assertNotIn(prefix, "".join(p.read_text() for p in self.root.glob("*/*.jsonl")))
+
+    def test_unrecoverable_records_block_replay_but_capture_direct_fields(self):
+        broken_records = [
+            b'{"type":"response_item","payload":{"type":"reasoning","encrypted_content":"PRIVATE\n',
+            b'{"type":"event_msg","payload":{"type":"user_message","message":"a\x01b"}}\n',
+            b'\xff\n', b'[]\n',
+        ]
+        for broken in broken_records:
+            with self.subTest(record=broken), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                root = Path(directory)
+                rollout = root / "damaged.jsonl"
+                original = broken + (json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "after"}}) + "\n").encode()
+                rollout.write_bytes(original)
+                event = {"session_id": "s", "turn_id": "t", "transcript_path": str(rollout),
+                         "hook_event_name": "UserPromptSubmit", "prompt": "current prompt"}
+                with memory.Store(root) as store:
+                    blocked = optchat.ingest(store, event)
+                    self.assertEqual(blocked["recovery"], "blocked")
+                    self.assertEqual(store.state("transcript:" + str(rollout.resolve()))["offset"], 0)
+                    optchat.ingest(store, event)
+                    self.assertEqual(store.total, 1)
+                    self.assertEqual(store.message(0)["text"], "current prompt")
+                with patch.dict(os.environ, {"OPTCHAT_DIR": str(root)}), patch.object(sys, "stdin", io.StringIO(json.dumps(event))), contextlib.redirect_stdout(io.StringIO()) as output:
+                    optchat.hook()
+                result = json.loads(output.getvalue())
+                self.assertIn("hookSpecificOutput", result)
+                self.assertIn("replay is blocked", result["systemMessage"])
+                self.assertEqual(rollout.read_bytes(), original)
+
+    def test_reasoning_recovery_requires_complete_matching_replacement(self):
+        prefix = "gAAAAA" + "a" * 64
+        fragment = {"ordinal": 12, "type": "response_item", "payload": {
+            "type": "reasoning", "id": "rs_example", "encrypted_content": prefix}}
+        broken = json.dumps(fragment).encode()[:-3] + b"\n"
+        for mutation in ({"ordinal": 13}, {"payload": dict(fragment["payload"], id="different")},
+                         {"payload": dict(fragment["payload"], encrypted_content="different")},
+                         {"type": "event_msg"}, {"payload": []}):
+            candidate = json.dumps(dict(fragment, **mutation)).encode() + b"\n"
+            self.assertIsNone(optchat.superseding_reasoning(io.BytesIO(candidate), broken))
+        replacement = json.dumps(dict(fragment, payload=dict(fragment["payload"], encrypted_content=prefix + "tail"))).encode()
+        rollout = self.root / "partial.jsonl"
+        event = {"session_id": "s", "transcript_path": str(rollout)}
+        # An incomplete EOF fragment is never consumed or diagnosed.
+        rollout.write_bytes(broken[:-1])
+        with memory.Store(self.root) as store:
+            optchat.ingest(store, event)
+            self.assertEqual(store.state("transcript:" + str(rollout.resolve()))["offset"], 0)
+            self.assertIsNone(store.state("last_replay_error"))
+        # A newline-terminated fragment must await the complete replacement too.
+        rollout.write_bytes(broken + replacement)
+        with memory.Store(self.root) as store:
+            self.assertIsNotNone(optchat.ingest(store, event))
+            self.assertEqual(store.state("transcript:" + str(rollout.resolve()))["offset"], 0)
+        with rollout.open("ab") as stream:
+            stream.write(b"\n")
+        with memory.Store(self.root) as store:
+            self.assertIsNone(optchat.ingest(store, event))
+            self.assertEqual(store.state("transcript:" + str(rollout.resolve()))["offset"], rollout.stat().st_size)
+            self.assertEqual(store.state("last_replay_error")["recovery"], "superseded_reasoning")
+            self.assertEqual(store.total, 0)
+
+    def test_reasoning_recovery_budget_boundary_keeps_direct_capture(self):
+        prefix = "gAAAAA" + "a" * 64
+        row = {"ordinal": 12, "type": "response_item", "payload": {
+            "type": "reasoning", "id": "rs_example", "encrypted_content": prefix}}
+        broken = json.dumps(row).encode()[:-3] + b"\n"
+        replacement = (json.dumps(row) + "\n").encode()
+        rollout = self.root / "bounded.jsonl"
+        rollout.write_bytes(broken + replacement)
+        event = {"session_id": "s", "turn_id": "t", "transcript_path": str(rollout),
+                 "hook_event_name": "UserPromptSubmit", "prompt": "current prompt"}
+        with memory.Store(self.root) as store:
+            optchat.ingest(store, event, deadline=0)
+            self.assertEqual(store.state("transcript:" + str(rollout.resolve()))["offset"], len(broken))
+            self.assertEqual(store.message(0)["text"], "current prompt")
             optchat.ingest(store, event)
             self.assertEqual(store.total, 1)
 

@@ -161,6 +161,16 @@ records and at the budget boundary. Later hooks resume from the saved byte
 offset; duplicate records do not rewrite the views. Large first-time backfills
 may take several hook deliveries to finish, while direct hook fields still
 capture the active prompt, tool result, and final reply.
+An interrupted encrypted reasoning write can be passed only when the next
+record is complete reasoning with the same id, ordinal, and encrypted prefix.
+Other malformed records block replay at their original offset while stable
+direct hook fields continue capturing; the hook reports the blocked range.
+The adapter leaves the native transcript unchanged and records each failed
+byte range, SHA-256, parser error, and replacement evidence without contents.
+`status()` exposes `replay_errors` and `last_replay_error` for investigation;
+these diagnostics remain after replay catches up. A final record without a
+newline still waits for the writer to finish. This recovery applies only to
+native rollout input; damaged authoritative OptChat memory logs remain errors.
 The plugin archives text, not binary image/audio attachments or full subagent
 conversations. Those remain in their original Codex sessions.
 

@@ -6,6 +6,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -78,6 +79,56 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def superseding_reasoning(stream, line):
+    """Recognize an excluded reasoning fragment re-emitted completely next.
+
+    Never guess past a damaged visible message. Require a complete replacement
+    with the same permanent reasoning id, ordinal, and encrypted byte prefix.
+    Timestamps may differ when Codex resumes the interrupted write.
+    """
+    position = stream.tell()
+    try:
+        fragment = json.loads(line.rstrip(b"\r\n") + b'"}}')
+        payload = fragment.get("payload", {})
+        prefix = payload.get("encrypted_content", "")
+        if (fragment.get("type") != "response_item" or payload.get("type") != "reasoning"
+                or type(fragment.get("ordinal")) is not int
+                or not isinstance(payload.get("id"), str) or not payload["id"]
+                or not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z0-9_=-]{32,}", prefix)):
+            return None
+        replacement = stream.readline()
+        if not replacement.endswith(b"\n"):
+            return None
+        row = json.loads(replacement)
+        complete = row.get("payload", {})
+        encrypted = complete.get("encrypted_content")
+        if (row.get("type") == "response_item" and complete.get("type") == "reasoning"
+                and row.get("ordinal") == fragment["ordinal"] and complete.get("id") == payload["id"]
+                and isinstance(encrypted, str) and encrypted.startswith(prefix)):
+            return {"offset": position, "bytes": len(replacement),
+                    "sha256": hashlib.sha256(replacement).hexdigest(),
+                    "ordinal": fragment["ordinal"], "reasoning_id": payload["id"]}
+    except (ValueError, AttributeError, TypeError):
+        return None
+    finally:
+        stream.seek(position)
+    return None
+
+
+def replay_error(store, path, offset, line, error, replacement):
+    """Retain byte-range evidence without copying private record contents."""
+    key = "transcript-error:%s:%d" % (path, offset)
+    diagnostic = {"path": str(path), "offset": offset, "bytes": len(line),
+                  "sha256": hashlib.sha256(line).hexdigest(), "error": str(error),
+                  "recovery": "superseded_reasoning" if replacement else "blocked"}
+    if replacement:
+        diagnostic["replacement"] = replacement
+    if store.state(key) != diagnostic:
+        store.set_state(key, diagnostic)
+        store.set_state("last_replay_error", diagnostic)
+    return diagnostic
+
+
 def ingest(store, event, deadline=None):
     """Incremental Codex rollout adapter; never persist reasoning or prompts.
 
@@ -87,6 +138,7 @@ def ingest(store, event, deadline=None):
     session = str(event.get("session_id", "unknown"))
     path = event.get("transcript_path") if event.get("hook_event_name") != "SubagentStop" else None
     turn = str(event.get("turn_id", "unknown"))
+    blocked = None
     if path and Path(path).is_file():
         key = "transcript:" + str(Path(path).resolve())
         cursor = store.state(key, {"offset": 0, "turn": turn})
@@ -103,11 +155,22 @@ def ingest(store, event, deadline=None):
                 line = stream.readline()
                 if not line or not line.endswith(b"\n"):
                     break  # a writer may still be completing the last line
-                row = json.loads(line)
-                payload = row.get("payload", {})
                 offset = stream.tell()
+                try:
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError("Rollout record must be a JSON object")
+                except (ValueError, UnicodeDecodeError) as error:
+                    replacement = superseding_reasoning(stream, line)
+                    diagnostic = replay_error(store, Path(path).resolve(), start, line, error, replacement)
+                    if replacement is None:
+                        offset = start  # preserve the failed record for deliberate recovery
+                        blocked = diagnostic
+                        break
+                    row = {}  # matched excluded reasoning; source bytes stay untouched
+                payload = row.get("payload", {})
                 if not isinstance(payload, dict):
-                    continue
+                    payload = {}
                 kind = payload.get("type")
                 if row.get("type") in ("turn_context", "event_msg") and payload.get("turn_id"):
                     turn = str(payload["turn_id"])
@@ -183,6 +246,7 @@ def ingest(store, event, deadline=None):
         name = str(event.get("agent_id") or event.get("agent_type") or "agent")
         store.append("work", "[%s] %s" % (name, event["last_assistant_message"]),
                      source="%s:work:%s:%s" % (session, name, turn))
+    return blocked
 
 
 def task(store, level, index):
@@ -356,7 +420,9 @@ def invoke(name, args):
             return {"id": args["id"], "date": store.message(args["id"])["date"]}
         if name == "status":
             return {"messages": store.total, "pending": store.db.execute("SELECT count(*) FROM jobs").fetchone()[0],
-                    "view_bytes": byte_size(store.render()), "last_error": store.state("last_compaction_error")}
+                    "view_bytes": byte_size(store.render()), "last_error": store.state("last_compaction_error"),
+                    "replay_errors": store.db.execute("SELECT count(*) FROM state WHERE key LIKE 'transcript-error:%'").fetchone()[0],
+                    "last_replay_error": store.state("last_replay_error")}
         raise ValueError("Unknown tool: %s" % name)
 
 
@@ -401,7 +467,7 @@ def hook(compact_after=False):
     private = bool(event.get("agent_id"))
     transcript = event.get("transcript_path")
     if transcript and Path(transcript).is_file() and name != "SubagentStop":
-        with open(transcript, encoding="utf-8") as stream:
+        with open(transcript, "rb") as stream:
             first = stream.readline()
         try:
             meta = json.loads(first).get("payload", {})
@@ -414,7 +480,7 @@ def hook(compact_after=False):
     with Store(directory()) as store:
         # Resume backfills must make progress without consuming the 30-second
         # synchronous hook timeout. Later hooks continue from a durable cursor.
-        ingest(store, event, deadline=time.monotonic() + 2)
+        blocked = ingest(store, event, deadline=time.monotonic() + 2)
         output = {}
         if name == "SessionStart":
             # Keep the dispatcher small. The fresh worker retrieves memory
@@ -427,6 +493,10 @@ def hook(compact_after=False):
             # a manually selected parent summary cannot become its continuity.
             output = {"hookSpecificOutput": {"hookEventName": name,
                                              "additionalContext": DISPATCH_INSTRUCTIONS}}
+        if blocked:
+            output["systemMessage"] = ("OptChat replay is blocked at byte %d in %s: %s. "
+                                       "Direct hook fields were captured; source records are preserved."
+                                       % (blocked["offset"], blocked["path"], blocked["error"]))
     if compact_after:
         compact(directory(), os.environ.get("OPTCHAT_MODEL"))
     print(encode(output))
